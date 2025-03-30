@@ -3,21 +3,23 @@ package com.mcp
 import io.ktor.server.application.*
 import io.ktor.server.cio.*
 import io.ktor.server.engine.*
-import io.ktor.server.routing.route
-import io.ktor.server.routing.routing
-import io.ktor.server.sse.SSE
+import io.ktor.utils.io.streams.*
 import io.modelcontextprotocol.kotlin.sdk.*
 import io.modelcontextprotocol.kotlin.sdk.server.Server
 import io.modelcontextprotocol.kotlin.sdk.server.ServerOptions
+import io.modelcontextprotocol.kotlin.sdk.server.StdioServerTransport
 import io.modelcontextprotocol.kotlin.sdk.server.mcp
 import kotlinx.cli.ArgParser
 import kotlinx.cli.ArgType
 import kotlinx.cli.required
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.runBlocking
+import kotlinx.io.asSink
+import kotlinx.io.buffered
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.jsonPrimitive
 import org.jetbrains.exposed.sql.Database
-import org.jetbrains.exposed.sql.Transaction
-import org.jetbrains.exposed.sql.transactions.transaction
-import java.net.URI
 
 val POSTGRES_SERVER = Server(
     serverInfo = Implementation(
@@ -31,6 +33,9 @@ val POSTGRES_SERVER = Server(
             ),
             resources = ServerCapabilities.Resources(
                 subscribe = false,
+                listChanged = false
+            ),
+            tools = ServerCapabilities.Tools(
                 listChanged = false
             )
         )
@@ -55,11 +60,41 @@ fun main(args: Array<String>) {
         ArgType.String,
         shortName = "p", description = "password"
     )
+    val database by parser.option(
+        ArgType.String,
+        shortName = "d", description = "database name"
+    )
     parser.parse(args)
     DATABASE_URL = databaseUrl
     USERNAME = username ?: "postgres"
     PASSWORD = password ?: ""
+    DATABASE = database ?: "postgres"
     runSseServerUsingKtorPlugin(3000)
+//    runStdio()
+}
+
+fun runStdio() {
+    println("Starting sse server on stdin")
+    println("Use inspector to connect to the stdin")
+    val transport = StdioServerTransport(
+        System.`in`.asInput(),
+        System.out.asSink().buffered()
+    )
+    runBlocking {
+        Database.connect(
+            "jdbc:postgresql://${DATABASE_URL}/${DATABASE}",
+            driver = "org.postgresql.Driver",
+            user = USERNAME,
+            password = PASSWORD
+        )
+        registerMCPServer()
+        POSTGRES_SERVER.connect(transport)
+        val done = Job()
+        POSTGRES_SERVER.onClose {
+            done.complete()
+        }
+        done.join()
+    }
 }
 
 fun runSseServerUsingKtorPlugin(port: Int): Unit = runBlocking {
@@ -75,7 +110,7 @@ fun Application.configureDatabase() {
     println("Connecting to database at: $DATABASE_URL")
     try {
         Database.connect(
-            "jdbc:postgresql://${DATABASE_URL}",
+            "jdbc:postgresql://${DATABASE_URL}/${DATABASE}",
             driver = "org.postgresql.Driver",
             user = USERNAME,
             password = PASSWORD
@@ -88,37 +123,47 @@ fun Application.configureDatabase() {
 }
 
 fun Application.module() {
-    // 注册 MCP 资源处理器
-    POSTGRES_SERVER.setRequestHandler(Method.Defined.ResourcesList) { _: ListResourcesRequest, _ ->
-        println("Received ResourcesList request")
-        val resources = transaction {
-            try {
-                exec("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'") { rs ->
-                    val tables = mutableListOf<Resource>()
-                    while (rs.next()) {
-                        val tableName = rs.getString("table_name")
-                        println("Found table: $tableName")
-                        tables.add(
-                            Resource(
-                                uri = "postgres://$tableName/schema",
-                                mimeType = "application/json",
-                                name = "$tableName database schema",
-                                description = "The public schema of the $tableName table"
-                            )
-                        )
-                    }
-                    println("Total tables found: ${tables.size}")
-                    ListResourcesResult(resources = tables)
-                }
-            } catch (e: Exception) {
-                println("Error executing query: ${e.message}")
-                ListResourcesResult(emptyList())
-            }
-        }
-        resources ?: ListResourcesResult(emptyList())
-    }
+    registerMCPServer()
     // 将 MCP 服务器注册在根路径
     mcp {
         POSTGRES_SERVER
+    }
+}
+
+fun registerMCPServer() {
+    // 注册 MCP 资源处理器
+//    POSTGRES_SERVER.setRequestHandler(Method.Defined.ResourcesList) { _: ListResourcesRequest, _ ->
+//        println("Received ResourcesList request")
+//        val resources = table()
+//        resources ?: ListResourcesResult(emptyList())
+//    }
+//    POSTGRES_SERVER.setRequestHandler(Method.Defined.ResourcesRead) { request: ReadResourceRequest, extra ->
+//        println("Received ResourcesRead request")
+//        ddl(request)
+//    }
+    POSTGRES_SERVER.addTool(
+        name = "query",
+        description = "Run a read-only query",
+        inputSchema = Tool.Input(
+            properties = JsonObject(
+                mapOf(
+                    "sql" to JsonObject(
+                        mapOf(
+                            "type" to JsonPrimitive("string"),
+                            "description" to JsonPrimitive("The SQL query to run")
+                        )
+                    )
+                )
+            ),
+            required = listOf("sql")
+        )
+    ) {
+        val sql = it.arguments["sql"]?.jsonPrimitive?.content
+        if (sql == null) {
+            return@addTool CallToolResult(
+                content = listOf(TextContent("The 'sql' argument is required")),
+            )
+        }
+        query(sql)
     }
 }
